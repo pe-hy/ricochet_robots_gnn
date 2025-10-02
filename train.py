@@ -42,69 +42,70 @@ class RicochetDataset(torch.utils.data.Dataset):
 
 
 class GNNModel(nn.Module):
-    def __init__(self, in_channels: int, hidden_channels: int, num_layers: int, 
+    def __init__(self, in_channels: int, hidden_channels: int, num_layers: int,
                  dropout: float, num_classes: int = 1, heads: int = 4):
         super().__init__()
-        
-        self.convs = nn.ModuleList()
-        self.residual_projs = nn.ModuleList()
-        
-        # First layer
-        self.convs.append(
-            GATv2Conv(
-                in_channels, 
-                hidden_channels // heads,
-                heads=heads,
-                concat=True,
-                dropout=dropout,
-                edge_dim=1,
-                add_self_loops=False
-            )
-        )
-        self.residual_projs.append(nn.Linear(in_channels, hidden_channels))
-        
-        # Hidden layers
-        for _ in range(num_layers - 2):
-            self.convs.append(
-                GATv2Conv(
-                    hidden_channels,
-                    hidden_channels // heads,
-                    heads=heads,
-                    concat=True,
-                    dropout=dropout,
-                    edge_dim=1,
-                    add_self_loops=False
-                )
-            )
-            self.residual_projs.append(nn.Identity())
-        
-        # Last layer (single head)
-        self.convs.append(
-            GATv2Conv(
-                hidden_channels,
-                hidden_channels,
-                heads=1,
-                concat=False,
-                dropout=dropout,
-                edge_dim=1,
-                add_self_loops=False
-            )
-        )
-        self.residual_projs.append(nn.Identity())
-        
-        self.classifier = nn.Linear(hidden_channels, num_classes)
+
+        self.num_layers = num_layers
         self.dropout = dropout
-    
+
+        # Input projection layer
+        self.input_conv = GATv2Conv(
+            in_channels,
+            hidden_channels // heads,
+            heads=heads,
+            concat=True,
+            dropout=dropout,
+            edge_dim=4,
+            add_self_loops=False
+        )
+        self.input_proj = nn.Linear(in_channels, hidden_channels)
+
+        # Single recurrent hidden layer (reused N-2 times)
+        self.hidden_conv = GATv2Conv(
+            hidden_channels,
+            hidden_channels // heads,
+            heads=heads,
+            concat=True,
+            dropout=dropout,
+            edge_dim=4,
+            add_self_loops=False
+        )
+
+        # Output layer (single head)
+        self.output_conv = GATv2Conv(
+            hidden_channels,
+            hidden_channels,
+            heads=1,
+            concat=False,
+            dropout=dropout,
+            edge_dim=4,
+            add_self_loops=False
+        )
+
+        self.classifier = nn.Linear(hidden_channels, num_classes)
+
     def forward(self, x, edge_index, edge_attr=None, batch=None):
-        for i, (conv, res_proj) in enumerate(zip(self.convs, self.residual_projs)):
-            identity = res_proj(x)
-            x = conv(x, edge_index, edge_attr=edge_attr)
+        # First layer
+        identity = self.input_proj(x)
+        x = self.input_conv(x, edge_index, edge_attr=edge_attr)
+        x = x + identity
+        x = F.elu(x)
+        x = F.dropout(x, p=self.dropout, training=self.training)
+
+        # Recurrent hidden layers (apply same layer N-2 times)
+        for i in range(self.num_layers - 2):
+            identity = x
+            x = self.hidden_conv(x, edge_index, edge_attr=edge_attr)
             x = x + identity
-            
-            if i < len(self.convs) - 1:
-                x = F.elu(x)
-                x = F.dropout(x, p=self.dropout, training=self.training)
-        
+            x = F.elu(x)
+            x = F.dropout(x, p=self.dropout, training=self.training)
+
+        # Last layer
+        identity = x
+        x = self.output_conv(x, edge_index, edge_attr=edge_attr)
+        x = x + identity
+
         return self.classifier(x)
 
 
@@ -141,17 +142,17 @@ class RicochetGNNModule(pl.LightningModule):
         return self.model(x, edge_index, edge_attr, batch)
     
     def training_step(self, batch, batch_idx):
-        x, edge_index, edge_attr = batch.x.float(), batch.edge_index, batch.edge_attr
+        x, edge_index, edge_attr = batch.x, batch.edge_index, batch.edge_attr
         logits = self(x, edge_index, edge_attr, batch.batch)
-        
+
         # Select loss function based on task
         if self.task == 'regression':
             # MSE loss for regression
-            y = batch.y.float().unsqueeze(-1)
+            y = batch.y.unsqueeze(-1)
             loss = F.mse_loss(logits, y)
         elif self.task == 'binning':
             # Cross entropy for multi-class classification
-            y = batch.y.long()
+            y = batch.y
             # Filter out -1 labels (non-main components)
             mask = y != -1
             if mask.sum() > 0:
@@ -160,23 +161,23 @@ class RicochetGNNModule(pl.LightningModule):
                 loss = torch.tensor(0.0, device=logits.device, requires_grad=True)
         else:
             # Binary cross entropy for binary tasks
-            y = batch.y.float().unsqueeze(-1)
+            y = batch.y.unsqueeze(-1)
             loss = F.binary_cross_entropy_with_logits(logits, y)
-        
+
         self.log('train_loss', loss, on_step=False, on_epoch=True, prog_bar=True, batch_size=batch.num_graphs)
         return loss
     
     def validation_step(self, batch, batch_idx):
-        x, edge_index, edge_attr = batch.x.float(), batch.edge_index, batch.edge_attr
+        x, edge_index, edge_attr = batch.x, batch.edge_index, batch.edge_attr
         logits = self(x, edge_index, edge_attr, batch.batch)
-        
+
         # Select loss function based on task
         if self.task == 'regression':
-            y = batch.y.float().unsqueeze(-1)
+            y = batch.y.unsqueeze(-1)
             loss = F.mse_loss(logits, y)
             preds = logits  # Use raw predictions for regression
         elif self.task == 'binning':
-            y = batch.y.long()
+            y = batch.y
             mask = y != -1
             if mask.sum() > 0:
                 loss = F.cross_entropy(logits[mask], y[mask])
@@ -184,30 +185,30 @@ class RicochetGNNModule(pl.LightningModule):
                 loss = torch.tensor(0.0, device=logits.device)
             preds = torch.argmax(logits, dim=-1)  # Get predicted class
         else:
-            y = batch.y.float().unsqueeze(-1)
+            y = batch.y.unsqueeze(-1)
             loss = F.binary_cross_entropy_with_logits(logits, y)
             preds = (torch.sigmoid(logits) > 0.5).float()
-        
+
         # Store predictions and labels per graph
         for graph_id in range(batch.num_graphs):
             mask = batch.batch == graph_id
             self.val_preds.append(preds[mask].cpu())
             self.val_labels.append(batch.y[mask].cpu())
-        
+
         self.log('val_loss', loss, on_epoch=True, prog_bar=True, batch_size=batch.num_graphs)
         return loss
     
     def test_step(self, batch, batch_idx):
-        x, edge_index, edge_attr = batch.x.float(), batch.edge_index, batch.edge_attr
+        x, edge_index, edge_attr = batch.x, batch.edge_index, batch.edge_attr
         logits = self(x, edge_index, edge_attr, batch.batch)
-        
+
         # Select loss function based on task
         if self.task == 'regression':
-            y = batch.y.float().unsqueeze(-1)
+            y = batch.y.unsqueeze(-1)
             loss = F.mse_loss(logits, y)
             preds = logits
         elif self.task == 'binning':
-            y = batch.y.long()
+            y = batch.y
             mask = y != -1
             if mask.sum() > 0:
                 loss = F.cross_entropy(logits[mask], y[mask])
@@ -215,16 +216,16 @@ class RicochetGNNModule(pl.LightningModule):
                 loss = torch.tensor(0.0, device=logits.device)
             preds = torch.argmax(logits, dim=-1)
         else:
-            y = batch.y.float().unsqueeze(-1)
+            y = batch.y.unsqueeze(-1)
             loss = F.binary_cross_entropy_with_logits(logits, y)
             preds = (torch.sigmoid(logits) > 0.5).float()
-        
+
         # Store predictions and labels per graph
         for graph_id in range(batch.num_graphs):
             mask = batch.batch == graph_id
             self.test_preds.append(preds[mask].cpu())
             self.test_labels.append(batch.y[mask].cpu())
-        
+
         self.log('test_loss', loss, batch_size=batch.num_graphs)
         return loss
     
@@ -247,8 +248,8 @@ class RicochetGNNModule(pl.LightningModule):
             with torch.no_grad():
                 for batch in self.test_loader_stored:
                     batch = batch.to(self.device)
-                    x, edge_index, edge_attr = batch.x.float(), batch.edge_index, batch.edge_attr
-                    
+                    x, edge_index, edge_attr = batch.x, batch.edge_index, batch.edge_attr
+
                     logits = self(x, edge_index, edge_attr, batch.batch)
                     
                     # Get predictions based on task

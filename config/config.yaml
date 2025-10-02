@@ -5,22 +5,22 @@ seed: 42
 data:
   data_dir: "data"                      # Directory containing the pickle files
   task: "basic"                        # Task type: basic, threshold, unreachable, regression, binning, best_component
-  val_size: 128                        # Number of graphs for validation
-  test_size: 128                       # Number of graphs for test
+  val_size: 256                        # Number of graphs for validation
+  test_size: 256                       # Number of graphs for test
   num_workers: 16                       # DataLoader workers
 
 model:
   in_channels: 4           # Feature dimension [empty, helper, targetbot, target]
   hidden_channels: 128      # Hidden layer dimension
-  num_layers: 8            # Number of GNN layers
-  dropout: 0.3             # Dropout rate
-  num_bins: 10            # Number of bins for binning task (ignored for other tasks)
+  num_layers: 8            # Number of iterations (num_layers - 2 = number of iterations  in the GNN)
+  dropout: 0.1             # Dropout rate
+  num_bins: 20            # Number of bins for binning task (ignored for other tasks)
   heads: 4
 
 training:
   batch_size: 128           # Batch size
   max_epochs: 100          # Maximum training epochs
-  max_lr: 0.002            # Maximum learning rate
+  max_lr: 0.01            # Maximum learning rate
   weight_decay: 0.0001     # Weight decay for AdamW
   warmup_epochs: 20        # Number of warmup epochs
 
