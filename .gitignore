@@ -1,6 +1,7 @@
 ricochet-robots-gnn-new/
 data/
 outputs/
+data_generation/
 # Folders with data, models, logs...
 !data_generation/*.py
 !data_generation/*.gitkeep
