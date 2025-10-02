@@ -41,72 +41,66 @@ class RicochetDataset(torch.utils.data.Dataset):
         return self.data[idx]
 
 
-class DirectionalGNN(MessagePassing):
-    def __init__(self, in_channels, out_channels, residual=True):
-        super().__init__(aggr='add')
-        self.lin = nn.Linear(in_channels, out_channels)
-        self.edge_lin = nn.Linear(1, out_channels)
-        
-        # Residual connection
-        self.residual = residual
-        if residual and in_channels != out_channels:
-            self.res_proj = nn.Linear(in_channels, out_channels)
-        elif residual:
-            self.res_proj = nn.Identity()
-        
-    def forward(self, x, edge_index, edge_attr=None):
-        # Propagate messages
-        out = self.propagate(edge_index, x=x, edge_attr=edge_attr)
-        
-        # Add residual
-        if self.residual:
-            out = out + self.res_proj(x)
-        
-        return out
-    
-    def message(self, x_j, edge_attr):
-        # x_j: [E, in_channels] - source node features
-        # edge_attr: [E, 1] - edge direction (1=forward, 0=backward)
-        
-        # Transform node features
-        msg = self.lin(x_j)
-        
-        # Modulate by edge direction
-        if edge_attr is not None:
-            direction_weight = self.edge_lin(edge_attr)
-            msg = msg * direction_weight
-        
-        return msg
-
-
 class GNNModel(nn.Module):
-    def __init__(self, in_channels: int, hidden_channels: int, num_layers: int, dropout: float, num_classes: int = 1):
+    def __init__(self, in_channels: int, hidden_channels: int, num_layers: int, 
+                 dropout: float, num_classes: int = 1, heads: int = 4):
         super().__init__()
         
         self.convs = nn.ModuleList()
+        self.residual_projs = nn.ModuleList()
         
-        # First layer (no residual due to dimension change)
+        # First layer
         self.convs.append(
-            DirectionalGNN(in_channels, hidden_channels, residual=False)
+            GATv2Conv(
+                in_channels, 
+                hidden_channels // heads,
+                heads=heads,
+                concat=True,
+                dropout=dropout,
+                edge_dim=1,
+                add_self_loops=False
+            )
         )
+        self.residual_projs.append(nn.Linear(in_channels, hidden_channels))
         
-        # Hidden layers (with residual)
+        # Hidden layers
         for _ in range(num_layers - 2):
             self.convs.append(
-                DirectionalGNN(hidden_channels, hidden_channels, residual=True)
+                GATv2Conv(
+                    hidden_channels,
+                    hidden_channels // heads,
+                    heads=heads,
+                    concat=True,
+                    dropout=dropout,
+                    edge_dim=1,
+                    add_self_loops=False
+                )
             )
+            self.residual_projs.append(nn.Identity())
         
-        # Last layer (with residual)
+        # Last layer (single head)
         self.convs.append(
-            DirectionalGNN(hidden_channels, hidden_channels, residual=True)
+            GATv2Conv(
+                hidden_channels,
+                hidden_channels,
+                heads=1,
+                concat=False,
+                dropout=dropout,
+                edge_dim=1,
+                add_self_loops=False
+            )
         )
+        self.residual_projs.append(nn.Identity())
         
         self.classifier = nn.Linear(hidden_channels, num_classes)
         self.dropout = dropout
     
     def forward(self, x, edge_index, edge_attr=None, batch=None):
-        for i, conv in enumerate(self.convs):
-            x = conv(x, edge_index, edge_attr)
+        for i, (conv, res_proj) in enumerate(zip(self.convs, self.residual_projs)):
+            identity = res_proj(x)
+            x = conv(x, edge_index, edge_attr=edge_attr)
+            x = x + identity
+            
             if i < len(self.convs) - 1:
                 x = F.elu(x)
                 x = F.dropout(x, p=self.dropout, training=self.training)
@@ -133,7 +127,8 @@ class RicochetGNNModule(pl.LightningModule):
             hidden_channels=cfg.model.hidden_channels,
             num_layers=cfg.model.num_layers,
             dropout=cfg.model.dropout,
-            num_classes=num_classes
+            num_classes=num_classes,
+            heads=cfg.model.get('heads', 4)
         )
         
         self.val_preds = []
