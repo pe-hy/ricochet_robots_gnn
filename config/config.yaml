@@ -1,0 +1,28 @@
+# Ricochet Robots GNN Training Configuration
+
+seed: 42
+
+data:
+  data_dir: "data"                      # Directory containing the pickle files
+  task: "basic"                        # Task type: basic, threshold, unreachable, regression, binning, best_component
+  val_size: 128                        # Number of graphs for validation
+  test_size: 128                       # Number of graphs for test
+  num_workers: 16                       # DataLoader workers
+
+model:
+  in_channels: 4           # Feature dimension [empty, helper, targetbot, target]
+  hidden_channels: 128      # Hidden layer dimension
+  num_layers: 6            # Number of GNN layers
+  dropout: 0.3             # Dropout rate
+  num_bins: 100            # Number of bins for binning task (ignored for other tasks)
+
+training:
+  batch_size: 256           # Batch size
+  max_epochs: 100          # Maximum training epochs
+  max_lr: 0.002            # Maximum learning rate
+  weight_decay: 0.0001     # Weight decay for AdamW
+  warmup_epochs: 20        # Number of warmup epochs
+
+wandb:
+  project: "ricochet-robots-gnn-new"
+  run_name: "directional-gnn"  # Will become "directional-gnn-basic", "directional-gnn-threshold", etc.
