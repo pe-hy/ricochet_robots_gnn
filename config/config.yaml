@@ -14,7 +14,7 @@ model:
   hidden_channels: 128      # Hidden layer dimension
   num_layers: 8            # Number of iterations (num_layers - 2 = number of iterations  in the GNN)
   dropout: 0.1             # Dropout rate
-  num_bins: 20            # Number of bins for binning task (ignored for other tasks)
+  num_bins: 28            # Number of bins for binning task (ignored for other tasks)
   heads: 4
 
 training:
@@ -26,4 +26,4 @@ training:
 
 wandb:
   project: "ricochet-robots-gnn-new"
-  run_name: "directional-gnn"  # Will become "directional-gnn-basic", "directional-gnn-threshold", etc.
+  run_name: "directional-gnn-${model.num_layers}"  # Will become "directional-gnn-basic", "directional-gnn-threshold", etc.

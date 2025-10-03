@@ -147,9 +147,13 @@ class RicochetGNNModule(pl.LightningModule):
 
         # Select loss function based on task
         if self.task == 'regression':
-            # MSE loss for regression
+            # MSE loss for regression (excluding -1 labels)
             y = batch.y.unsqueeze(-1)
-            loss = F.mse_loss(logits, y)
+            mask = batch.y != -1
+            if mask.sum() > 0:
+                loss = F.mse_loss(logits[mask], y[mask])
+            else:
+                loss = torch.tensor(0.0, device=logits.device, requires_grad=True)
         elif self.task == 'binning':
             # Cross entropy for multi-class classification
             y = batch.y
@@ -174,7 +178,11 @@ class RicochetGNNModule(pl.LightningModule):
         # Select loss function based on task
         if self.task == 'regression':
             y = batch.y.unsqueeze(-1)
-            loss = F.mse_loss(logits, y)
+            mask = batch.y != -1
+            if mask.sum() > 0:
+                loss = F.mse_loss(logits[mask], y[mask])
+            else:
+                loss = torch.tensor(0.0, device=logits.device)
             preds = logits  # Use raw predictions for regression
         elif self.task == 'binning':
             y = batch.y
@@ -205,7 +213,11 @@ class RicochetGNNModule(pl.LightningModule):
         # Select loss function based on task
         if self.task == 'regression':
             y = batch.y.unsqueeze(-1)
-            loss = F.mse_loss(logits, y)
+            mask = batch.y != -1
+            if mask.sum() > 0:
+                loss = F.mse_loss(logits[mask], y[mask])
+            else:
+                loss = torch.tensor(0.0, device=logits.device)
             preds = logits
         elif self.task == 'binning':
             y = batch.y
@@ -233,17 +245,18 @@ class RicochetGNNModule(pl.LightningModule):
         self._compute_metrics(self.val_preds, self.val_labels, 'val')
         self.val_preds.clear()
         self.val_labels.clear()
-        
+
         # Run test evaluation every 5 epochs
         if (self.current_epoch + 1) % 5 == 0 and self.test_loader_stored is not None:
             print(f"\n{'='*60}")
             print(f"Running test evaluation at epoch {self.current_epoch + 1}")
             print(f"{'='*60}")
-            
+
             # Run test evaluation
             test_preds = []
             test_labels = []
-            
+            test_graphs_with_preds = [] if self.task == 'best_component' else None
+
             self.eval()
             with torch.no_grad():
                 for batch in self.test_loader_stored:
@@ -251,7 +264,7 @@ class RicochetGNNModule(pl.LightningModule):
                     x, edge_index, edge_attr = batch.x, batch.edge_index, batch.edge_attr
 
                     logits = self(x, edge_index, edge_attr, batch.batch)
-                    
+
                     # Get predictions based on task
                     if self.task == 'regression':
                         preds = logits
@@ -259,17 +272,55 @@ class RicochetGNNModule(pl.LightningModule):
                         preds = torch.argmax(logits, dim=-1)
                     else:
                         preds = (torch.sigmoid(logits) > 0.5).float()
-                    
+
                     # Store per-graph predictions
                     for graph_id in range(batch.num_graphs):
                         mask = batch.batch == graph_id
-                        test_preds.append(preds[mask].cpu())
-                        test_labels.append(batch.y[mask].cpu())
-            
+                        graph_preds = preds[mask].cpu()
+                        graph_labels = batch.y[mask].cpu()
+
+                        test_preds.append(graph_preds)
+                        test_labels.append(graph_labels)
+
+                        # Save full graph data only for best_component task
+                        if self.task == 'best_component':
+                            # Get edge mask for this graph
+                            edge_mask = (batch.batch[batch.edge_index[0]] == graph_id) & \
+                                       (batch.batch[batch.edge_index[1]] == graph_id)
+
+                            # Create new Data object with original data + predictions as y2
+                            graph_data = Data(
+                                x=batch.x[mask].cpu(),
+                                edge_index=batch.edge_index[:, edge_mask].cpu(),
+                                edge_attr=batch.edge_attr[edge_mask].cpu(),
+                                y=graph_labels,
+                                y2=graph_preds.squeeze()
+                            )
+
+                            # Renumber edge_index to be relative to this graph (0-indexed)
+                            if graph_data.edge_index.numel() > 0:
+                                node_offset = mask.nonzero(as_tuple=True)[0][0].to(graph_data.edge_index.device)
+                                graph_data.edge_index = graph_data.edge_index - node_offset
+
+                            test_graphs_with_preds.append(graph_data)
+
             self.train()
-            
-            # Compute and log test metrics (only exact match)
-            self._compute_metrics(test_preds, test_labels, 'test', log_to_wandb=True)
+
+            # Compute and log test metrics (returns exact match ratio)
+            exact_match_ratio = self._compute_metrics(test_preds, test_labels, 'test', log_to_wandb=True)
+
+            # Save predictions to pickle file (only for best_component task)
+            if self.task == 'best_component':
+                save_dir = Path('test_predictions')
+                save_dir.mkdir(exist_ok=True)
+
+                filename = f"test_predictions_{self.current_epoch + 1}_{exact_match_ratio:.4f}.pkl"
+                save_path = save_dir / filename
+
+                with open(save_path, 'wb') as f:
+                    pickle.dump(test_graphs_with_preds, f)
+
+                print(f"Saved test predictions to {save_path}")
     
     def on_test_epoch_end(self):
         self._compute_metrics(self.test_preds, self.test_labels, 'test_final')
@@ -280,35 +331,33 @@ class RicochetGNNModule(pl.LightningModule):
         """
         Compute metrics where preds_list and labels_list are lists of per-graph predictions.
         Each element in the list corresponds to one graph.
+        Returns exact_match_ratio.
         """
         # Flatten all predictions and labels for node-level metrics
         all_preds = torch.cat(preds_list).squeeze().numpy()
         all_labels = torch.cat(labels_list).squeeze().numpy()
-        
+
         # Compute metrics based on task type
         if self.task == 'regression':
-            # For regression, use MAE and RMSE
-            mae = np.mean(np.abs(all_preds - all_labels))
-            rmse = np.sqrt(np.mean((all_preds - all_labels) ** 2))
-            accuracy = mae  # Use MAE as "accuracy" for logging
-            precision = rmse
-            recall = 0.0
-            f1 = 0.0
+            # For regression, use MAE and RMSE (excluding -1 labels)
+            mask = all_labels != -1
+            mae = np.mean(np.abs(all_preds[mask] - all_labels[mask]))
+            rmse = np.sqrt(np.mean((all_preds[mask] - all_labels[mask]) ** 2))
         else:
             # For classification tasks
             accuracy = accuracy_score(all_labels, all_preds)
             precision = precision_score(all_labels, all_preds, zero_division=0, average='binary' if self.task != 'binning' else 'macro')
             recall = recall_score(all_labels, all_preds, zero_division=0, average='binary' if self.task != 'binning' else 'macro')
             f1 = f1_score(all_labels, all_preds, zero_division=0, average='binary' if self.task != 'binning' else 'macro')
-        
+
         # Graph-level exact match
         num_graphs = len(preds_list)
         exact_matches = 0
-        
+
         for graph_preds, graph_labels in zip(preds_list, labels_list):
             graph_preds = graph_preds.squeeze().numpy()
             graph_labels = graph_labels.squeeze().numpy()
-            
+
             if self.task == 'regression':
                 # For regression, consider exact if within tolerance
                 if np.allclose(graph_preds, graph_labels, atol=1.0):
@@ -316,25 +365,33 @@ class RicochetGNNModule(pl.LightningModule):
             else:
                 if (graph_preds == graph_labels).all():
                     exact_matches += 1
-        
+
         exact_match_ratio = exact_matches / num_graphs
         
         # Log to wandb based on prefix
         if log_to_wandb:
             if prefix == 'val':
                 # Log validation metrics
-                self.log('val_accuracy', accuracy, prog_bar=True)
-                self.log('val_precision', precision, prog_bar=False)
-                self.log('val_recall', recall, prog_bar=False)
+                if self.task == 'regression':
+                    self.log('val_mae', mae, prog_bar=True)
+                    self.log('val_rmse', rmse, prog_bar=False)
+                else:
+                    self.log('val_accuracy', accuracy, prog_bar=True)
+                    self.log('val_precision', precision, prog_bar=False)
+                    self.log('val_recall', recall, prog_bar=False)
                 self.log('val_exact_match', exact_match_ratio, prog_bar=True)
             elif prefix == 'test':
                 # Log only exact match for periodic test evaluation
                 self.log('test_exact_match', exact_match_ratio, prog_bar=True)
             elif prefix == 'test_final':
                 # Log final test metrics
-                self.log('test_final_accuracy', accuracy)
-                self.log('test_final_precision', precision)
-                self.log('test_final_recall', recall)
+                if self.task == 'regression':
+                    self.log('test_final_mae', mae)
+                    self.log('test_final_rmse', rmse)
+                else:
+                    self.log('test_final_accuracy', accuracy)
+                    self.log('test_final_precision', precision)
+                    self.log('test_final_recall', recall)
                 self.log('test_final_exact_match', exact_match_ratio)
         
         # Print to console
@@ -350,6 +407,8 @@ class RicochetGNNModule(pl.LightningModule):
             print(f"  Recall:       {recall:.4f}")
             print(f"  F1 Score:     {f1:.4f}")
             print(f"  Exact Match:  {exact_match_ratio:.4f} ({exact_matches}/{num_graphs})")
+
+        return exact_match_ratio
     
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(
